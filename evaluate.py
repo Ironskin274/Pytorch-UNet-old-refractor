@@ -6,7 +6,7 @@ from utils.dice_score import multiclass_dice_coeff, dice_coeff
 
 
 @torch.inference_mode()
-def evaluate(net, dataloader, device, amp):
+def evaluate(net, dataloader, device, amp, use_3d=False):
     net.eval()
     num_val_batches = len(dataloader)
     dice_score = 0
@@ -17,7 +17,11 @@ def evaluate(net, dataloader, device, amp):
             image, mask_true = batch['image'], batch['mask']
 
             # move images and labels to correct device and type
-            image = image.to(device=device, dtype=torch.float32, memory_format=torch.channels_last)
+            if use_3d:
+                # 3D数据不使用channels_last内存格式
+                image = image.to(device=device, dtype=torch.float32)
+            else:
+                image = image.to(device=device, dtype=torch.float32, memory_format=torch.channels_last)
             mask_true = mask_true.to(device=device, dtype=torch.long)
 
             # predict the mask
@@ -31,8 +35,14 @@ def evaluate(net, dataloader, device, amp):
             else:
                 assert mask_true.min() >= 0 and mask_true.max() < net.n_classes, 'True mask indices should be in [0, n_classes['
                 # convert to one-hot format
-                mask_true = F.one_hot(mask_true, net.n_classes).permute(0, 3, 1, 2).float()
-                mask_pred = F.one_hot(mask_pred.argmax(dim=1), net.n_classes).permute(0, 3, 1, 2).float()
+                if use_3d:
+                    # 3D: (B, C, D, H, W)
+                    mask_true = F.one_hot(mask_true, net.n_classes).permute(0, 4, 1, 2, 3).float()
+                    mask_pred = F.one_hot(mask_pred.argmax(dim=1), net.n_classes).permute(0, 4, 1, 2, 3).float()
+                else:
+                    # 2D: (B, C, H, W)
+                    mask_true = F.one_hot(mask_true, net.n_classes).permute(0, 3, 1, 2).float()
+                    mask_pred = F.one_hot(mask_pred.argmax(dim=1), net.n_classes).permute(0, 3, 1, 2).float()
                 # compute the Dice score, ignoring background
                 dice_score += multiclass_dice_coeff(mask_pred[:, 1:], mask_true[:, 1:], reduce_batch_first=False)
 
