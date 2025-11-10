@@ -16,9 +16,15 @@ from tqdm import tqdm
 import wandb
 from evaluate import evaluate
 from unet import UNet
-from utils.data_loading import BasicDataset, CarvanaDataset
+from utils.data_loading import BasicDataset, CarvanaDataset, BraTS2020Dataset
 from utils.dice_score import dice_loss
 
+# BraTS2020数据集路径
+dir_brats_train = '/data/ssd2/liying/Datasets/BraTS2020/MICCAI_BraTS2020_TrainingData/'
+train_list_file = '/data/ssd2/liying/Datasets/BraTS2020/train_list.txt'
+valid_list_file = '/data/ssd2/liying/Datasets/BraTS2020/valid_list.txt'
+
+# 原始数据集路径（保留以支持其他数据集）
 dir_img = Path('./data/imgs/')
 dir_mask = Path('./data/masks/')
 dir_checkpoint = Path('./checkpoints/')
@@ -37,17 +43,35 @@ def train_model(
         weight_decay: float = 1e-8,
         momentum: float = 0.999,
         gradient_clipping: float = 1.0,
+        use_brats: bool = True,
 ):
     # 1. Create dataset
-    try:
-        dataset = CarvanaDataset(dir_img, dir_mask, img_scale)
-    except (AssertionError, RuntimeError, IndexError):
-        dataset = BasicDataset(dir_img, dir_mask, img_scale)
+    if use_brats:
+        # 使用BraTS2020数据集，按照预定义的train_list和valid_list划分
+        logging.info('Using BraTS2020 dataset')
+        train_set = BraTS2020Dataset(
+            data_dir=dir_brats_train,
+            list_file=train_list_file,
+            scale=img_scale
+        )
+        val_set = BraTS2020Dataset(
+            data_dir=dir_brats_train,
+            list_file=valid_list_file,
+            scale=img_scale
+        )
+        n_train = len(train_set)
+        n_val = len(val_set)
+    else:
+        # 使用原始数据集
+        try:
+            dataset = CarvanaDataset(dir_img, dir_mask, img_scale)
+        except (AssertionError, RuntimeError, IndexError):
+            dataset = BasicDataset(dir_img, dir_mask, img_scale)
 
-    # 2. Split into train / validation partitions
-    n_val = int(len(dataset) * val_percent)
-    n_train = len(dataset) - n_val
-    train_set, val_set = random_split(dataset, [n_train, n_val], generator=torch.Generator().manual_seed(0))
+        # 2. Split into train / validation partitions
+        n_val = int(len(dataset) * val_percent)
+        n_train = len(dataset) - n_val
+        train_set, val_set = random_split(dataset, [n_train, n_val], generator=torch.Generator().manual_seed(0))
 
     # 3. Create data loaders
     loader_args = dict(batch_size=batch_size, num_workers=os.cpu_count(), pin_memory=True)
@@ -55,7 +79,12 @@ def train_model(
     val_loader = DataLoader(val_set, shuffle=False, drop_last=True, **loader_args)
 
     # (Initialize logging)
-    experiment = wandb.init(project='U-Net', resume='allow', anonymous='must')
+    # 使用BraTS模式时使用专门的项目名称
+    project_name = 'BraTS2020-UNet' if use_brats else 'U-Net'
+    
+    # 使用已登录的wandb账号
+    experiment = wandb.init(project=project_name, resume='allow')
+    
     experiment.config.update(
         dict(epochs=epochs, batch_size=batch_size, learning_rate=learning_rate,
              val_percent=val_percent, save_checkpoint=save_checkpoint, img_scale=img_scale, amp=amp)
@@ -162,7 +191,11 @@ def train_model(
         if save_checkpoint:
             Path(dir_checkpoint).mkdir(parents=True, exist_ok=True)
             state_dict = model.state_dict()
-            state_dict['mask_values'] = dataset.mask_values
+            # 保存mask_values
+            if use_brats:
+                state_dict['mask_values'] = train_set.mask_values
+            else:
+                state_dict['mask_values'] = dataset.mask_values
             torch.save(state_dict, str(dir_checkpoint / 'checkpoint_epoch{}.pth'.format(epoch)))
             logging.info(f'Checkpoint {epoch} saved!')
 
@@ -180,6 +213,8 @@ def get_args():
     parser.add_argument('--amp', action='store_true', default=False, help='Use mixed precision')
     parser.add_argument('--bilinear', action='store_true', default=False, help='Use bilinear upsampling')
     parser.add_argument('--classes', '-c', type=int, default=2, help='Number of classes')
+    parser.add_argument('--use-brats', action='store_true', default=False, 
+                        help='Use BraTS2020 dataset (default: False)')
 
     return parser.parse_args()
 
@@ -192,9 +227,18 @@ if __name__ == '__main__':
     logging.info(f'Using device {device}')
 
     # Change here to adapt to your data
-    # n_channels=3 for RGB images
+    # n_channels=3 for RGB images (or 4 for BraTS2020)
     # n_classes is the number of probabilities you want to get per pixel
-    model = UNet(n_channels=3, n_classes=args.classes, bilinear=args.bilinear)
+    # BraTS2020: 4 modalities (t1, t1ce, t2, flair), 4 classes (background + 3 tumor types)
+    if args.use_brats:
+        n_channels = 4  # BraTS有4个模态
+        n_classes = 4   # 4个类别：背景、坏死、水肿、增强肿瘤
+        logging.info('Using BraTS2020 dataset configuration: 4 input channels, 4 output classes')
+    else:
+        n_channels = 3
+        n_classes = args.classes
+    
+    model = UNet(n_channels=n_channels, n_classes=n_classes, bilinear=args.bilinear)
     model = model.to(memory_format=torch.channels_last)
 
     logging.info(f'Network:\n'
@@ -218,7 +262,8 @@ if __name__ == '__main__':
             device=device,
             img_scale=args.scale,
             val_percent=args.val / 100,
-            amp=args.amp
+            amp=args.amp,
+            use_brats=args.use_brats
         )
     except torch.cuda.OutOfMemoryError:
         logging.error('Detected OutOfMemoryError! '
@@ -234,5 +279,6 @@ if __name__ == '__main__':
             device=device,
             img_scale=args.scale,
             val_percent=args.val / 100,
-            amp=args.amp
+            amp=args.amp,
+            use_brats=args.use_brats
         )
